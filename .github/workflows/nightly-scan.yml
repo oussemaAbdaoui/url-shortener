@@ -1,0 +1,35 @@
+name: Nightly Security Scans
+
+on:
+  schedule:
+    # Run at 2 AM UTC daily
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run dependency audit
+      run: |
+        pip install safety
+        safety check -r requirements.txt --json > safety-report.json
+        
+    - name: Run Snyk security scan
+      uses: snyk/actions/python@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --sarif-file-output=snyk-results.sarif
+        
+    - name: Upload security reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: nightly-security-reports
+        path: |
+          safety-report.json
+          snyk-results.sarif

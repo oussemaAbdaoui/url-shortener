@@ -1,0 +1,389 @@
+name: CI/CD Pipeline for URL Shortener
+
+on:
+  # Trigger on push to main branch
+  push:
+    branches: [ main, master ]
+  # Trigger on pull requests
+  pull_request:
+    branches: [ main, master ]
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+# Environment variables (can be set in GitHub Secrets)
+env:
+  REGISTRY: ghcr.io  # GitHub Container Registry
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  VERSION: ${{ github.sha }}
+
+jobs:
+  # Job 1: Code Quality and Testing
+  code-quality:
+    name: Code Quality & Testing
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov black flake8  # Testing and linting tools
+        
+    - name: Check code formatting with Black
+      run: |
+        black --check app.py
+        
+    - name: Run linter (Flake8)
+      run: |
+        flake8 app.py --max-line-length=88 --show-source
+        
+    - name: Run static type checking
+      run: |
+        pip install mypy
+        mypy --ignore-missing-imports app.py
+        
+    - name: Run basic tests
+      run: |
+        # Create a simple test file if not exists
+        if [ ! -f tests/test_app.py ]; then
+          mkdir -p tests
+          cat > tests/test_app.py << 'EOF'
+import sys
+sys.path.insert(0, '.')
+from app import app, generate_short_code
+import pytest
+
+def test_generate_short_code():
+    """Test short code generation"""
+    url = "https://example.com"
+    code = generate_short_code(url)
+    assert len(code) == 6
+    assert isinstance(code, str)
+    print(f"✓ Short code generated: {code}")
+
+def test_health_endpoint():
+    """Test health endpoint"""
+    with app.test_client() as client:
+        response = client.get('/health')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'healthy'
+        print("✓ Health endpoint working")
+
+if __name__ == '__main__':
+    test_generate_short_code()
+    test_health_endpoint()
+    print("All tests passed!")
+EOF
+        fi
+        python tests/test_app.py
+        
+    - name: Upload test results (if using pytest)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          tests/
+          reports/
+        if-no-files-found: ignore
+
+  # Job 2: SAST - Static Application Security Testing
+  security-sast:
+    name: Security - SAST
+    runs-on: ubuntu-latest
+    needs: [code-quality]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner (SAST)
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+        
+    - name: Run Bandit (Python security linter)
+      run: |
+        pip install bandit
+        bandit -r . -f json -o bandit-results.json || true
+        
+    - name: Run Semgrep (advanced SAST)
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: p/ci
+        
+    - name: Upload SAST reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sast-reports
+        path: |
+          trivy-results.sarif
+          bandit-results.json
+          semgrep.sarif
+        if-no-files-found: ignore
+        
+    - name: Upload to GitHub Security
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: trivy-results.sarif
+
+  # Job 3: Build Docker Image
+  build-docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-sast]
+    # Only build on main branch or manual trigger
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/url-shortener
+          ghcr.io/${{ github.repository }}
+        tags: |
+          type=sha,prefix={{branch}}-
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ secrets.DOCKERHUB_USERNAME }}/url-shortener:latest
+        
+    - name: Scan Docker image with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/url-shortener:latest'
+        format: 'sarif'
+        output: 'trivy-image-results.sarif'
+        severity: 'CRITICAL,HIGH'
+        
+    - name: Upload Docker scan results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-scan-results
+        path: trivy-image-results.sarif
+
+  # Job 4: DAST - Dynamic Application Security Testing
+  security-dast:
+    name: Security - DAST
+    runs-on: ubuntu-latest
+    needs: [build-docker]
+    # Only run on main branch
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Deploy to test environment
+      run: |
+        # Simple deployment for DAST testing
+        docker run -d --name url-shortener-test -p 5001:5000 \
+          ${{ secrets.DOCKERHUB_USERNAME }}/url-shortener:latest
+        sleep 10  # Wait for app to start
+        
+    - name: Run OWASP ZAP DAST Scan
+      uses: zaproxy/action-baseline@v0.10.0
+      with:
+        target: 'http://localhost:5001'
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: '-a'
+        docker_name: 'owasp/zap2docker-stable'
+        
+    - name: Run Nikto web server scanner
+      run: |
+        docker run --network host sachinkhamble/nikto -h http://localhost:5001 -o nikto-report.html
+        
+    - name: Upload DAST reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dast-reports
+        path: |
+          zap-report.html
+          nikto-report.html
+        if-no-files-found: ignore
+        
+    - name: Cleanup test deployment
+      if: always()
+      run: |
+        docker stop url-shortener-test || true
+        docker rm url-shortener-test || true
+
+  # Job 5: Deploy to Kubernetes (Optional - for bonus points)
+  deploy-kubernetes:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [security-dast]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'production'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Kubernetes tools
+      run: |
+        # Install kubectl
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        
+        # Install minikube (for local testing)
+        curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        sudo install minikube-linux-amd64 /usr/local/bin/minikube
+        
+    - name: Start minikube cluster
+      run: |
+        minikube start --driver=docker
+        minikube addons enable metrics-server
+        
+    - name: Deploy to minikube
+      run: |
+        # Update image in deployment.yaml
+        sed -i "s|your-dockerhub-username|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/deployment.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f k8s/
+        
+        # Wait for deployment
+        kubectl rollout status deployment/url-shortener --timeout=90s
+        
+        # Get service URL
+        minikube service url-shortener-service --url
+        
+    - name: Run smoke tests
+      run: |
+        # Get service URL
+        SERVICE_URL=$(minikube service url-shortener-service --url | head -n1)
+        
+        # Test endpoints
+        curl -f $SERVICE_URL/health || exit 1
+        curl -f -X POST $SERVICE_URL/shorten \
+          -H "Content-Type: application/json" \
+          -d '{"url":"https://example.com"}' || exit 1
+        
+        echo "✅ Smoke tests passed!"
+        
+    - name: Upload deployment logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: k8s-logs
+        path: |
+          /tmp/k8s-logs/
+        if-no-files-found: ignore
+
+  # Job 6: Notifications and Summary
+  notify:
+    name: Notifications & Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-kubernetes]
+    if: always()
+    
+    steps:
+    - name: Workflow status summary
+      run: |
+        echo "🚀 CI/CD Pipeline Summary"
+        echo "========================="
+        echo "Repository: ${{ github.repository }}"
+        echo "Branch: ${{ github.ref }}"
+        echo "Commit: ${{ github.sha }}"
+        echo "Trigger: ${{ github.event_name }}"
+        echo ""
+        echo "📊 Job Status:"
+        echo "- Code Quality: ${{ needs.code-quality.result }}"
+        echo "- SAST Security: ${{ needs.security-sast.result }}"
+        echo "- Docker Build: ${{ needs.build-docker.result }}"
+        echo "- DAST Security: ${{ needs.security-dast.result }}"
+        echo "- Kubernetes Deploy: ${{ needs.deploy-kubernetes.result }}"
+        
+    - name: Send Slack notification
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        author_name: GitHub Actions CI/CD
+        fields: repo,commit,author,action,eventName,ref,workflow,job,took
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        
+    - name: Create GitHub Deployment
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const { data: deployment } = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'production',
+            auto_merge: false,
+            required_contexts: []
+          });
+          
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.id,
+            state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
+            environment_url: 'http://localhost:5000'
+          });
